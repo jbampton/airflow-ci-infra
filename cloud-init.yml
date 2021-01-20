@@ -1,0 +1,222 @@
+#cloud-config
+# 2021-01-20 22:12
+
+fs_setup:
+  - filesystem: ext4
+    device: /dev/nvme1n1
+    label: docker
+    partition: auto
+  - filesystem: ext4
+    device: /dev/nvme2n1
+    label: local-ssd
+    partition: auto
+
+mounts:
+  - [LABEL=docker, /var/lib/docker, auto, "defaults,nofail"]
+  - [LABEL=local-ssd, /opt/ssd, auto, "defaults,nofail,user=runner"]
+
+users:
+  - default
+  - name: runner
+
+packages:
+  - awscli
+  - build-essential
+  - docker-compose
+  - docker.io
+  - git
+  - iptables-persistent
+  - jq
+  - python3-dev
+  - python3-venv
+  - python3-wheel
+  - yarn
+
+runcmd:
+  -
+    - bash
+    - -c
+    - |
+      set -exu -o pipefail
+      echo "AWS_DEFAULT_REGION=$(cloud-init query region)" >> /etc/environment
+      set -a
+      . /etc/environment
+      set +a
+      echo "ASG_GROUP_NAME=$(aws ec2 describe-tags --filter Name=resource-id,Values=$(cloud-init query instance_id) Name=key,Values=aws:autoscaling:groupName \
+            | jq -r '@sh "\(.Tags[0].Value)"')" >> /etc/environment
+
+      echo 'ACTIONS_SQS_URL=https://sqs.eu-central-1.amazonaws.com/827901512104/actions-runner-requests' >> /etc/environment
+
+      # Add environment to cron job
+      #cat /etc/environment >> /etc/cron.d/cloudwatch-metrics-github-runners
+  - [systemctl, daemon-reload]
+  -
+    - bash
+    - -c
+    - |
+      python3 -mvenv /opt/runner-creds-lock
+      /opt/runner-creds-lock/bin/pip install -U pip python-dynamodb-lock-whatnick==0.9.3 click==7.1.2
+  -
+    - bash
+    - -c
+    - |
+      set -exu -o pipefail
+
+      usermod -G docker -a runner
+
+      mkdir -p ~runner/actions-runner
+      cd ~runner/actions-runner
+
+      RUNNER_VERSION="$0"
+
+      curl -L "https://github.com/ashb/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" | tar -zx
+
+      aws s3 cp s3://airflow-ci-assets/get-runner-creds.py /opt/runner-creds-lock/bin/get-runner-creds
+      chmod 755 /opt/runner-creds-lock/bin/get-runner-creds
+    - 2.276.0-airflow1
+  - [mkdir, -p, /opt/ssd/hostedtoolcache, /opt/sdd/work, /opt/hostedtoolcache, /home/runner/actions-runner/_work ]
+  -
+    - bash
+    - -c
+    - |
+      echo '/opt/ssd/hostedtoolcache /opt/hostedtoolcache none defaults,bind 0 0' >> /etc/fstab
+      mount /opt/hostedtoolcache
+
+      echo '/opt/ssd/work /home/runner/actions-runner/_work none defaults,bind 0 0' >> /etc/fstab
+      mount /home/runner/actions-runner/_work
+      chown runner: /opt/ssd/work /home/runner/actions-runner/_work /opt/ssd/hostedtoolcache /opt/hostedtoolcache
+  - [systemctl, enable, --now, iptables.service]
+  - [systemctl, enable, actions.runner-credentials.service]
+  - [systemctl, enable, --now, actions.runner.service]
+  -
+    - bash
+    - -c
+    - |
+      echo "Pre-loading commonly used docker images from S3"
+      set -eux -o pipefail
+      aws s3 cp s3://airflow-ci-assets/pre-baked-images.tar.gz - | docker load
+
+write_files:
+  - path: /etc/systemd/system/actions.runner.service
+    content: |
+      [Unit]
+      Description=GitHub Actions Runner
+      After=network.target
+      Requires=actions.runner-credentials.service
+
+      [Service]
+      ExecStartPre=!/usr/local/sbin/runner-cleanup-workdir.sh
+      ExecStart=/home/runner/actions-runner/run.sh --once --startuptype service
+      EnvironmentFile=/etc/environment
+      User=runner
+      WorkingDirectory=/home/runner/actions-runner
+      KillMode=process
+      KillSignal=SIGTERM
+      TimeoutStopSec=5min
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Don't put this in ~runner, as these get written before the user is added, and this messes up creating the home dir
+  - path: /usr/local/sbin/runner-cleanup-workdir.sh
+    content: |
+      #!/bin/bash
+
+      if [[ -d ~runner/actions-runner/_work/airflow/airflow ]]; then
+        cd ~runner/actions-runner/_work/airflow/airflow
+
+        chown --changes -R runner: .
+        if [[ -e .git ]]; then
+          sudo -u runner bash -c "
+            git reset --hard && \
+            git submodule deinit --all -f && \
+            git submodule foreach git clean -fxd && \
+            git clean -fxd \
+          "
+        fi
+        docker ps -qa | xargs --no-run-if-empty docker rm -fv
+      fi
+
+      # We're idle now, ASG can kill us if it wants
+      aws autoscaling set-instance-protection  --no-protected-from-scale-in --instance-ids "$(cloud-init query instance_id)" --auto-scaling-group-name "$ASG_GROUP_NAME" >/dev/null
+
+      # Wait until we get an SQS message before continuing. This is mostly
+      # just for scailing reasons than anything else, and isn't really needed
+      # for actions runner to work
+      while true
+      do
+        msg="$(aws sqs receive-message --queue-url "$ACTIONS_SQS_URL" --max-number-of-messages 1)"
+        if [[ $? == 0 && -n "$msg" ]]; then
+          # We got a message!
+          aws --profile airflow sqs delete-message --queue-url "$ACTIONS_SQS_URL" --receipt-handle "$(jq '.Messages[0].ReceiptHandle' <<<"$msg" -r)"
+          # Set our instance to "busy" so ASG doesn't try to kill us
+          # TODO: This is a race -- some other runner may get the request from GitHub. We reset the protection
+          # every minute via cron job anyway.
+          aws autoscaling set-instance-protection --protected-from-scale-in --instance-ids "$(cloud-init query instance_id)" --auto-scaling-group-name "$ASG_GROUP_NAME" >/dev/null
+          exit 0
+        fi
+        sleep 5
+
+      done
+    owner: root:root
+    permissions: '0775'
+  - path: /etc/sudoers.d/runner
+    owner: root:root
+    permissions: '0440'
+    content: |
+      runner ALL=(ALL) NOPASSWD:/usr/sbin/swapoff -a, /usr/bin/rm -f /swapfile, /usr/bin/apt clean
+  - path: /etc/iptables/rules.v4
+    content: |
+      # Generated by iptables-save v1.8.4 on Thu Jan 14 13:59:27 2021
+      *filter
+      :INPUT ACCEPT [833:75929]
+      :FORWARD DROP [0:0]
+      :OUTPUT ACCEPT [794:143141]
+      :DOCKER-USER - [0:0]
+      -A FORWARD -j DOCKER-USER
+      # Dis-allow any docker container to access the metadata service
+      -A DOCKER-USER -d 169.254.169.254/32 -j REJECT --reject-with icmp-port-unreachable
+      -A DOCKER-USER -j RETURN
+      COMMIT
+
+  - path: /usr/local/sbin/actions-runner-ec2-reporting
+    permissions: '0775'
+    content: |
+      #!/bin/bash
+
+      if pgrep -c Runner.Worker >/dev/null; then
+          # Only report metric when we're doing something -- no point paying to submit zeros
+          aws cloudwatch put-metric-data --metric-name jobs-running --value "$(pgrep -c Runner.Worker)" --namespace github.actions
+          protection=--protected-from-scale-in
+      else
+          protection=--no-protected-from-scale-in
+      fi
+      aws autoscaling set-instance-protection "$protection" --instance-ids "$(cloud-init query instance_id)" --auto-scaling-group-name "$ASG_GROUP_NAME" >/dev/null
+
+  - path: /etc/cron.d/cloudwatch-metrics-github-runners
+    content: |
+      */1 * * * * nobody /usr/local/sbin/actions-runner-ec2-reporting
+
+  - path: /etc/systemd/system/actions.runner-credentials.service
+    content: |
+      [Unit]
+      Description=Credential fetcher for GitHub Actions Runner
+      After=network.target
+      Before=actions.runner.service
+
+      [Service]
+      Type=notify
+      ExecStart=/opt/runner-creds-lock/bin/python /opt/runner-creds-lock/bin/get-runner-creds
+      User=runner
+      WorkingDirectory=/home/runner/actions-runner
+      Restart=always
+      EnvironmentFile=/etc/environment
+
+      [Install]
+      WantedBy=multi-user.target
+apt:
+  sources:
+    yarn:
+      source: "deb https://dl.yarnpkg.com/debian/ stable main"
+      keyid: "1646B01B86E50310"
